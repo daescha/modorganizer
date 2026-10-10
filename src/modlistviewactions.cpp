@@ -841,23 +841,27 @@ void ModListViewActions::removeMods(const QModelIndexList& indices) const
 
 void ModListViewActions::ignoreMissingData(const QModelIndexList& indices) const
 {
+  std::vector<int> rows;
   for (auto& idx : indices) {
     int row_idx       = idx.data(ModList::IndexRole).toInt();
     ModInfo::Ptr info = ModInfo::getByIndex(row_idx);
     info->markValidated(true);
-    m_core.modList()->notifyChange(row_idx);
+    rows.push_back(row_idx);
   }
+  m_core.modList()->notifyChange(rows);
 }
 
 void ModListViewActions::setIgnoreUpdate(const QModelIndexList& indices,
                                          bool ignore) const
 {
+  std::vector<int> rows;
   for (auto& idx : indices) {
     int modIdx        = idx.data(ModList::IndexRole).toInt();
     ModInfo::Ptr info = ModInfo::getByIndex(modIdx);
     info->ignoreUpdate(ignore);
-    m_core.modList()->notifyChange(modIdx);
+    rows.push_back(modIdx);
   }
+  m_core.modList()->notifyChange(rows);
 }
 
 void ModListViewActions::changeVersioningScheme(const QModelIndex& index) const
@@ -901,12 +905,14 @@ void ModListViewActions::changeVersioningScheme(const QModelIndex& index) const
 
 void ModListViewActions::markConverted(const QModelIndexList& indices) const
 {
+  std::vector<int> rows;
   for (auto& idx : indices) {
     int modIdx        = idx.data(ModList::IndexRole).toInt();
     ModInfo::Ptr info = ModInfo::getByIndex(modIdx);
     info->markConverted(true);
-    m_core.modList()->notifyChange(modIdx);
+    rows.push_back(modIdx);
   }
+  m_core.modList()->notifyChange(rows);
 }
 
 void ModListViewActions::visitOnNexus(const QModelIndexList& indices) const
@@ -1269,9 +1275,11 @@ void ModListViewActions::setCategories(
     setCategories(refMod, categories);
   }
 
+  std::vector<int> rows;
   for (auto& idx : selected) {
-    m_core.modList()->notifyChange(idx.data(ModList::IndexRole).toInt());
+    rows.push_back(idx.data(ModList::IndexRole).toInt());
   }
+  m_core.modList()->notifyChange(rows);
 
   // reset the selection manually - still needed
   auto viewIndices = m_view->indexModelToView(selected);

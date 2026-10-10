@@ -1285,6 +1285,14 @@ void ModList::notifyChange(int rowStart, int rowEnd)
   }
 }
 
+void ModList::notifyChange(const std::vector<int>& rows)
+{
+  if (!rows.empty()) {
+    const auto [lo, hi] = std::minmax_element(rows.begin(), rows.end());
+    notifyChange(*lo, *hi);
+  }
+}
+
 QModelIndex ModList::index(int row, int column, const QModelIndex&) const
 {
   if ((row < 0) || (row >= rowCount()) || (column < 0) || (column >= columnCount())) {
@@ -1416,9 +1424,7 @@ void ModList::shiftModsPriority(const QModelIndexList& indices, int offset)
 
   emit layoutChanged();
 
-  for (auto index : notify) {
-    notifyChange(index);
-  }
+  notifyChange(notify);
 
   emit modPrioritiesChanged(indices);
 }

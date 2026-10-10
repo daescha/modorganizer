@@ -133,6 +133,8 @@ public:
   void removeRowForce(int row, const QModelIndex& parent);
 
   void notifyChange(int rowStart, int rowEnd = -1);
+  // one dataChanged() over the rows' span, so the proxies re-sort once
+  void notifyChange(const std::vector<int>& rows);
   static QString getColumnName(int column);
 
   void changeModPriority(int sourceIndex, int newPriority);

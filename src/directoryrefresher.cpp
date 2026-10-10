@@ -38,6 +38,7 @@ along with Mod Organizer.  If not, see <http://www.gnu.org/licenses/>.
 #include <QDir>
 #include <QString>
 
+#include <filesystem>
 #include <fstream>
 
 using namespace MOBase;
@@ -159,6 +160,182 @@ void dumpStats(std::vector<DirectoryStats>& stats)
   out << std::format("total,{},{}", run, total.toCsv()) << "\n";
 
   ++run;
+}
+
+ModFileCache::~ModFileCache()
+{
+  stopWatcher();
+}
+
+void ModFileCache::stopWatcher()
+{
+  if (m_Watcher.joinable()) {
+    ::SetEvent(m_Stop);
+    m_Watcher.join();
+  }
+
+  if (m_Stop) {
+    ::CloseHandle(m_Stop);
+    m_Stop = nullptr;
+  }
+}
+
+void ModFileCache::setRoot(const std::wstring& modsDirectory)
+{
+  std::wstring root = ToLowerCopy(modsDirectory);
+  if (!root.empty() && root.back() != L'\\') {
+    root += L'\\';
+  }
+
+  if (m_Watcher.joinable() && root == m_WatchedRoot) {
+    return;
+  }
+
+  stopWatcher();
+  m_WatchedRoot = root;
+
+  HANDLE dir = ::CreateFileW(
+      modsDirectory.c_str(), FILE_LIST_DIRECTORY,
+      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+      FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED, nullptr);
+
+  if (dir == INVALID_HANDLE_VALUE) {
+    log::warn("refresher: can't watch '{}', mod file lists are not cached: {}",
+              modsDirectory, formatSystemMessage(::GetLastError()));
+    return;
+  }
+
+  m_Stop    = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  m_Watcher = std::thread([this, dir, root] {
+    SetThisThreadName("mod file watcher");
+    watch(dir, root);
+  });
+}
+
+void ModFileCache::watch(HANDLE dir, const std::wstring& root)
+{
+  std::vector<DWORD> buffer(16 * 1024);
+  OVERLAPPED ov = {};
+  ov.hEvent     = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+
+  const DWORD filter = FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME |
+                       FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE;
+
+  for (;;) {
+    ::ResetEvent(ov.hEvent);
+
+    if (!::ReadDirectoryChangesW(dir, buffer.data(),
+                                 static_cast<DWORD>(buffer.size() * sizeof(DWORD)),
+                                 TRUE, filter, nullptr, &ov, nullptr)) {
+      log::warn("refresher: watching '{}' failed, mod file lists are not cached: {}",
+                root, formatSystemMessage(::GetLastError()));
+      break;
+    }
+
+    {
+      // caching starts once the first watch is queued, so no change goes unseen
+      std::scoped_lock lock(m_Mutex);
+      m_Root = root;
+    }
+
+    HANDLE handles[] = {ov.hEvent, m_Stop};
+    if (::WaitForMultipleObjects(2, handles, FALSE, INFINITE) != WAIT_OBJECT_0) {
+      DWORD ignored = 0;
+      ::CancelIoEx(dir, &ov);
+      ::GetOverlappedResult(dir, &ov, &ignored, TRUE);
+      break;
+    }
+
+    DWORD bytes = 0;
+    if (!::GetOverlappedResult(dir, &ov, &bytes, FALSE) || bytes == 0) {
+      clear();
+      continue;
+    }
+
+    auto* p = reinterpret_cast<const unsigned char*>(buffer.data());
+    for (;;) {
+      const auto* info = reinterpret_cast<const FILE_NOTIFY_INFORMATION*>(p);
+      const std::wstring_view name(info->FileName,
+                                   info->FileNameLength / sizeof(wchar_t));
+
+      invalidate(ToLowerCopy(name.substr(0, name.find(L'\\'))));
+
+      if (info->NextEntryOffset == 0) {
+        break;
+      }
+
+      p += info->NextEntryOffset;
+    }
+  }
+
+  {
+    std::scoped_lock lock(m_Mutex);
+    m_Root.clear();
+  }
+
+  clear();
+  ::CloseHandle(ov.hEvent);
+  ::CloseHandle(dir);
+}
+
+void ModFileCache::invalidate(const std::wstring& key)
+{
+  std::scoped_lock lock(m_Mutex);
+  m_Dirs.erase(key);
+
+  if (m_Walking.contains(key)) {
+    m_ChangedWhileWalking.insert(key);
+  }
+}
+
+void ModFileCache::clear()
+{
+  std::scoped_lock lock(m_Mutex);
+  m_Dirs.clear();
+  m_ChangedWhileWalking.insert(m_Walking.begin(), m_Walking.end());
+}
+
+env::Directory ModFileCache::get(const std::wstring& path)
+{
+  const std::wstring lc = ToLowerCopy(path);
+  std::wstring key;
+  std::shared_ptr<const env::Directory> cached;
+
+  {
+    std::scoped_lock lock(m_Mutex);
+
+    if (!m_Root.empty() && lc.starts_with(m_Root)) {
+      key = lc.substr(m_Root.size(), lc.find(L'\\', m_Root.size()) - m_Root.size());
+    }
+
+    if (!key.empty()) {
+      if (auto itor = m_Dirs.find(key); itor != m_Dirs.end()) {
+        cached = itor->second;
+      } else {
+        m_Walking.insert(key);
+      }
+    }
+  }
+
+  // DirectoryEntry::insert() moves names out of the list, so callers get a copy
+  if (cached) {
+    return *cached;
+  }
+
+  auto dir = std::make_shared<const env::Directory>(
+      std::filesystem::exists(path) ? env::getFilesAndDirs(path) : env::Directory());
+
+  if (!key.empty()) {
+    std::scoped_lock lock(m_Mutex);
+
+    if (m_ChangedWhileWalking.erase(key) == 0) {
+      m_Dirs[key] = dir;
+    }
+
+    m_Walking.erase(key);
+  }
+
+  return *dir;
 }
 
 DirectoryRefresher::DirectoryRefresher(OrganizerCore* core, std::size_t threadCount)
@@ -333,7 +510,7 @@ struct ModThread
   std::set<std::wstring> enabledArchives;
   std::vector<std::wstring>* loadOrder = nullptr;
   DirectoryStats* stats                = nullptr;
-  env::DirectoryWalker walker;
+  ModFileCache* cache                  = nullptr;
 
   std::condition_variable cv;
   std::mutex mutex;
@@ -357,7 +534,8 @@ struct ModThread
     });
 
     SetThisThreadName(QString::fromStdWString(modName + L" refresher"));
-    ds->addFromOrigin(walker, modName, path, prio, *stats);
+    env::Directory files = cache->get(path);
+    ds->addFromList(modName, path, files, prio, *stats);
 
     if (Settings::instance().archiveParsing()) {
       ds->addFromAllBSAs(modName, path, prio, archives, enabledArchives, *loadOrder,
@@ -444,6 +622,7 @@ void DirectoryRefresher::addMultipleModsFilesToStructure(
 
         mt.loadOrder = &loadOrder;
         mt.stats     = &stats[i];
+        mt.cache     = &m_Cache;
 
         mt.wakeup();
       }
@@ -469,6 +648,8 @@ void DirectoryRefresher::refresh()
     QMutexLocker locker(&m_RefreshLock);
 
     m_Root.reset(new DirectoryEntry(L"data", nullptr, 0));
+    m_Cache.setRoot(
+        QDir::toNativeSeparators(m_Core.settings().paths().mods()).toStdWString());
 
     IPluginGame* game = qApp->property("managed_game").value<IPluginGame*>();
 

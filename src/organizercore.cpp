@@ -1287,6 +1287,7 @@ void OrganizerCore::refresh(bool saveChanges)
 
   m_ModList.notifyChange(-1);
 
+  m_DirectoryRefresher->clearCache();
   refreshDirectoryStructure();
 
   emit refreshTriggered();

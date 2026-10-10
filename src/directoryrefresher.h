@@ -26,11 +26,46 @@ along with Mod Organizer.  If not, see <http://www.gnu.org/licenses/>.
 #include <QMutex>
 #include <QObject>
 #include <QStringList>
+#include <memory>
+#include <mutex>
 #include <set>
+#include <thread>
 #include <tuple>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 class OrganizerCore;
+
+namespace env
+{
+struct Directory;
+}
+
+// caches the file list of each folder under the mods directory until a watcher sees it change
+class ModFileCache
+{
+public:
+  ~ModFileCache();
+
+  void setRoot(const std::wstring& modsDirectory);
+  env::Directory get(const std::wstring& path);
+  void clear();
+
+private:
+  std::mutex m_Mutex;
+  std::wstring m_Root;
+  std::wstring m_WatchedRoot;
+  std::unordered_map<std::wstring, std::shared_ptr<const env::Directory>> m_Dirs;
+  std::unordered_set<std::wstring> m_Walking;
+  std::unordered_set<std::wstring> m_ChangedWhileWalking;
+  HANDLE m_Stop = nullptr;
+  std::thread m_Watcher;
+
+  void stopWatcher();
+  void watch(HANDLE dir, const std::wstring& root);
+  void invalidate(const std::wstring& key);
+};
 
 /**
  * @brief used to asynchronously generate the virtual view of the combined data
@@ -57,6 +92,8 @@ public:
   };
 
   DirectoryRefresher(OrganizerCore* core, std::size_t threadCount);
+
+  void clearCache() { m_Cache.clear(); }
 
   /**
    * @brief retrieve the updated directory structure
@@ -156,6 +193,7 @@ private:
   QMutex m_RefreshLock;
   std::size_t m_threadCount;
   std::size_t m_lastFileCount;
+  ModFileCache m_Cache;
 
   void stealModFilesIntoStructure(MOShared::DirectoryEntry* directoryStructure,
                                   const QString& modName, int priority,
